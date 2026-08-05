@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package cache;
+
+option go_package = "plugin/executable/cache";
+
+// CachedEntry 是统一的缓存条目，用于 Redis 缓存存储和 memory_cache dump。
+// Redis 存储时只用 msg/stored_time/expiration_time/block_hole_tag（key 是 Redis key）。
+// dump 文件额外用 key/cache_expiration_time（需要持久化 key 和缓存条目过期时间）。
+message CachedEntry {
+  bytes msg = 1;
+  int64 stored_time = 2;
+  int64 expiration_time = 3;
+  string block_hole_tag = 4;
+  bytes key = 5;                      // dump 文件用
+  int64 cache_expiration_time = 6;    // dump 文件用
+}
+
+// CacheDumpBlock 是 memory_cache dump 文件的分块格式。
+message CacheDumpBlock {
+  repeated CachedEntry entries = 1;
+}

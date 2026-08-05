@@ -64,9 +64,11 @@ func init() {
 			}
 
 			go func() {
-				c := make(chan os.Signal, 1)
-				signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
-				sig := <-c
+				sigC := make(chan os.Signal, 1)
+				signal.Notify(sigC, syscall.SIGINT, syscall.SIGTERM)
+				// defer 解除信号注册，避免进程退出后信号处理器残留。
+				defer signal.Stop(sigC)
+				sig := <-sigC
 				m.logger.Warn("signal received", zap.Stringer("signal", sig))
 				m.sc.SendCloseSignal(nil)
 			}()

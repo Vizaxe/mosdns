@@ -244,21 +244,24 @@ func (dc *TraditionalDnsConn) queueLen() int {
 // It returns a nil c if queue has too many queries.
 // Caller must call deleteQueueC to release the qid in queue.
 func (dc *TraditionalDnsConn) addQueueC() (qid uint16, c chan *[]byte) {
-	c = make(chan *[]byte)
+	c = make(chan *[]byte, 1)
 	dc.queueMu.Lock()
-	for i := 0; i < 3; i++ {
+	defer dc.queueMu.Unlock()
+
+	// nextQid 为 uint16 自动回绕，共 65536 个可分配 qid；
+	// 在途查询数远小于该空间，循环必然能找到未占用的 qid。
+	// 用 65536 次迭代作为兜底保护，避免队列异常占满时死循环。
+	// 原实现仅尝试 3 次，高并发（在途查询数千）下会随机返回
+	// ErrTDCTooManyQueries 造成无谓失败。
+	for i := 0; i < 65536; i++ {
 		qid = dc.nextQid
 		dc.nextQid++
 		if _, dup := dc.queue[uint32(qid)]; dup {
 			continue
 		}
 		dc.queue[uint32(qid)] = c
-		dc.queueMu.Unlock()
 		return qid, c
 	}
-	dc.queueMu.Unlock()
-
-	// Too many queries in queue. Can't assign qid.
 	return 0, nil
 }
 

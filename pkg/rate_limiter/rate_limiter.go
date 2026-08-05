@@ -31,7 +31,6 @@ type tableShard struct {
 type limiterEntry struct {
 	l        *rate.Limiter
 	lastSeen time.Time
-	sync.Once
 }
 
 // NewRateLimiter creates a new client rate limiter.

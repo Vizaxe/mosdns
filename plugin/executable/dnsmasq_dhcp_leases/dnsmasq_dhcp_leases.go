@@ -23,10 +23,9 @@ import (
 	"context"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/coremain"
-	"github.com/IrineSistiana/mosdns/v5/pkg/cache_backend"
+	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
-	"github.com/IrineSistiana/mosdns/v5/plugin/executable/cache"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/cache/redis_cache"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/b0ch3nski/go-dnsmasq-utils/dnsmasq"
@@ -34,6 +33,7 @@ import (
 	"go.uber.org/zap"
 	"os"
 	"strings"
+	"sync"
 )
 
 const PluginType = "dnsmasq_dhcp_leases"
@@ -51,15 +51,31 @@ type Args struct {
 }
 
 type Leases struct {
-	args       *Args
-	logger     *zap.Logger
-	file       string
+	args   *Args
+	logger *zap.Logger
+	file   string
+
+	// mu 保护以下字段在 watch goroutine 和请求处理 goroutine 之间的并发访问
+	mu         sync.RWMutex
 	leases     []*dnsmasq.Lease
 	ipv4Leases []*dnsmasq.Lease
 	ipv6Leases []*dnsmasq.Lease
 	leaseChan  chan []*dnsmasq.Lease
 	matcher    domain.Matcher[*leasesGroup]
-	cache      cache.Cache[cache_backend.StringKey, string]
+
+	// cache 用于缓存查询结果。仅支持 RedisCache（NewLeases 中类型断言）。
+	// 使用具体类型以便通过 DeleteByQuery 增量清理缓存，避免 Clean 全量删除
+	// 误伤同库共享同前缀的其他业务 key。
+	cache *redis_cache.RedisCache
+
+	// 以下字段仅由初始化流程与 watch goroutine 串行访问，
+	// 记录上次同步到缓存的 hostname 与 PTR 名，用于增量删除。
+	lastCacheFqdns    map[string]struct{}
+	lastCachePtrFqdns map[string]struct{}
+
+	// ctx 用于取消后台 goroutine，cancel 在 Close 时调用
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type leasesGroup struct {
@@ -82,9 +98,13 @@ func NewLeases(bp *coremain.BP, args *Args) (*Leases, error) {
 		file:      args.File,
 		leaseChan: make(chan []*dnsmasq.Lease),
 	}
+	l.ctx, l.cancel = context.WithCancel(context.Background())
 
 	if len(strings.TrimSpace(args.CacheTag)) > 0 {
-		redisCache := bp.M().GetPlugin(args.CacheTag).(*redis_cache.RedisCache)
+		redisCache, ok := bp.M().GetPlugin(args.CacheTag).(*redis_cache.RedisCache)
+		if !ok {
+			return nil, fmt.Errorf("%s is not a RedisCache plugin", args.CacheTag)
+		}
 		l.cache = redisCache
 	}
 
@@ -99,22 +119,39 @@ func NewLeases(bp *coremain.BP, args *Args) (*Leases, error) {
 		return nil, fmt.Errorf("failed to read dnsmasq lease file %s: %w", args.File, err)
 	}
 	l.leases = initialLeases
-	l.buildMatchers()
+	ipMap := l.buildMatchers()
+	// 初始化时同步一次缓存（锁外执行，Redis IO 不阻塞初始化）
+	l.syncCache(ipMap)
 
-	// 后台监听文件变更
-	go dnsmasq.WatchLeases(context.Background(), l.file, l.leaseChan)
-	go l.watch()
+	// 后台监听文件变更，使用可取消 context 以便 Close 时能终止 goroutine
+	go dnsmasq.WatchLeases(l.ctx, l.file, l.leaseChan)
+	go l.watch(l.ctx)
 	return l, nil
 }
 
-func (l *Leases) watch() {
-	for leaseBatch := range l.leaseChan {
-		l.leases = leaseBatch
-		l.buildMatchers()
+func (l *Leases) watch(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case leaseBatch, ok := <-l.leaseChan:
+			if !ok {
+				return
+			}
+			l.mu.Lock()
+			l.leases = leaseBatch
+			ipMap := l.buildMatchers()
+			l.mu.Unlock()
+			// 缓存同步（Redis 网络 IO）放在锁外，
+			// 避免文件变更时长时间阻塞查询路径的读锁。
+			l.syncCache(ipMap)
+		}
 	}
 }
 
-func (l *Leases) buildMatchers() {
+// buildMatchers 基于当前 l.leases 构建内存匹配结构，返回 ipMap 供缓存同步使用。
+// 必须在持有 l.mu（写锁）时调用。
+func (l *Leases) buildMatchers() map[string]*leasesGroup {
 	leases := l.leases
 	ipMap := make(map[string]*leasesGroup)
 	//if l.cache != nil {
@@ -161,21 +198,89 @@ func (l *Leases) buildMatchers() {
 		m.Add(key, value)
 	}
 	l.matcher = m
+	return ipMap
+}
 
-	if l.cache != nil {
-		l.cache.Clean()
-		for fqdn := range ipMap {
-			l.saveCache(fqdn, dns.TypeA)
-			l.saveCache(fqdn, dns.TypeAAAA)
-		}
-		for _, lease := range l.leases {
-			addr := lease.IPAddr
-			l.savePtr2Cache(addr)
+// syncCache 基于 ipMap 与上次同步记录做增量缓存同步（Redis 网络 IO）。
+// 必须在锁外调用，避免阻塞查询路径。
+func (l *Leases) syncCache(ipMap map[string]*leasesGroup) {
+	if l.cache == nil {
+		return
+	}
+
+	// 正向记录（hostname -> A/AAAA）
+	newFqdns := make(map[string]struct{}, len(ipMap))
+	for fqdn := range ipMap {
+		newFqdns[fqdn] = struct{}{}
+	}
+	// 删除已消失的 hostname 缓存，避免误删本库其他业务 key（不再全量 Clean）。
+	for fqdn := range l.lastCacheFqdns {
+		if _, ok := newFqdns[fqdn]; !ok {
+			l.deleteCache(fqdn, dns.TypeA)
+			l.deleteCache(fqdn, dns.TypeAAAA)
 		}
 	}
+	// 写入当前所有 hostname（幂等覆盖）。
+	for fqdn := range ipMap {
+		l.saveCache(fqdn, dns.TypeA)
+		l.saveCache(fqdn, dns.TypeAAAA)
+	}
+	l.lastCacheFqdns = newFqdns
+
+	// 反向记录（IP -> PTR）。
+	newPtrFqdns := make(map[string]struct{})
+	for _, g := range ipMap {
+		for _, l4 := range g.ipv4Leases {
+			if f := dnsutils.Ip2PtrFqdn(l4.IPAddr); len(f) > 0 {
+				newPtrFqdns[f] = struct{}{}
+			}
+		}
+		for _, l6 := range g.ipv6Leases {
+			if f := dnsutils.Ip2PtrFqdn(l6.IPAddr); len(f) > 0 {
+				newPtrFqdns[f] = struct{}{}
+			}
+		}
+	}
+	// 删除已消失的 PTR 缓存。
+	for fqdn := range l.lastCachePtrFqdns {
+		if _, ok := newPtrFqdns[fqdn]; !ok {
+			l.deleteCache(fqdn, dns.TypePTR)
+		}
+	}
+	// 写入当前所有 PTR（幂等覆盖）。
+	for _, g := range ipMap {
+		for _, l4 := range g.ipv4Leases {
+			l.savePtr2Cache(l4.IPAddr)
+		}
+		for _, l6 := range g.ipv6Leases {
+			l.savePtr2Cache(l6.IPAddr)
+		}
+	}
+	l.lastCachePtrFqdns = newPtrFqdns
+}
+
+// deleteCache 按与 saveCache/savePtr2Cache 一致的 key 精确删除缓存条目。
+func (l *Leases) deleteCache(fqdn string, qtype uint16) {
+	if l.cache == nil {
+		return
+	}
+	q := &dns.Msg{
+		Question: []dns.Question{{Name: fqdn, Qclass: dns.ClassINET, Qtype: qtype}},
+	}
+	_ = l.cache.DeleteByQuery(q)
+}
+
+// Close 停止后台文件监听 goroutine，释放资源。
+func (l *Leases) Close() error {
+	if l.cancel != nil {
+		l.cancel()
+	}
+	return nil
 }
 
 func (l *Leases) lookup(fqdn string) (ipv4, ipv6 []*dnsmasq.Lease) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	ips, ok := l.matcher.Match(fqdn)
 	if !ok {
 		return nil, nil // no such host
@@ -186,13 +291,13 @@ func (l *Leases) lookup(fqdn string) (ipv4, ipv6 []*dnsmasq.Lease) {
 func (l *Leases) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	if qCtx.R() == nil {
 		if r := l.responsePtr(qCtx.Q()); r != nil {
-			l.logger.Info("dhcp ptr cache hit", zap.Any("query", qCtx), zap.Any("resp", r))
+			l.logger.Debug("dhcp ptr cache hit", qCtx.InfoField(), zap.Int("rcode", r.Rcode))
 			qCtx.SetResponse(r)
 		}
 	}
 	if qCtx.R() == nil {
 		if r := l.responseQuery(qCtx.Q()); r != nil {
-			l.logger.Info("dhcp cache hit", zap.Any("query", qCtx), zap.Any("resp", r))
+			l.logger.Debug("dhcp cache hit", qCtx.InfoField(), zap.Int("rcode", r.Rcode))
 			qCtx.SetResponse(r)
 		}
 	}

@@ -89,7 +89,7 @@ func GetPluginType(typ string) (PluginTypeInfo, bool) {
 // newPlugin initializes a Plugin from c and adds it to mosdns.
 func (m *Mosdns) newPlugin(c PluginConfig) error {
 	if len(c.Tag) == 0 {
-		c.Tag = fmt.Sprintf("anonymouse_%s_%d", c.Type, len(m.plugins))
+		c.Tag = fmt.Sprintf("anonymous_%s_%d", c.Type, len(m.plugins))
 	}
 
 	if _, dup := m.plugins[c.Tag]; dup {

@@ -113,7 +113,7 @@ func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next s
 	shouldPass := make(chan struct{})
 	go func() {
 		qCtx := qCtxPreferred
-		ctx, cancel := context.WithDeadline(context.Background(), ddl)
+		ctx, cancel := context.WithDeadline(ctx, ddl)
 		defer cancel()
 		err := next.ExecNext(ctx, qCtx)
 		if err != nil {
@@ -135,7 +135,7 @@ func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next s
 	qCtxOrg := qCtx.Copy()
 	go func() {
 		qCtx := qCtxOrg
-		ctx, cancel := context.WithDeadline(context.Background(), ddl)
+		ctx, cancel := context.WithDeadline(ctx, ddl)
 		defer cancel()
 		doneChan <- next.ExecNext(ctx, qCtx)
 	}()

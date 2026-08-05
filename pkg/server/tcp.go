@@ -30,12 +30,14 @@ import (
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"github.com/miekg/dns"
 	"go.uber.org/zap"
 )
 
 const (
-	defaultTCPIdleTimeout = time.Second * 10
-	tcpFirstReadTimeout   = time.Second * 2
+	defaultTCPIdleTimeout       = time.Second * 10
+	tcpFirstReadTimeout         = time.Second * 2
+	defaultMaxConcurrentQueries = 1000
 )
 
 type TCPServerOpts struct {
@@ -44,6 +46,10 @@ type TCPServerOpts struct {
 
 	// Default is defaultTCPIdleTimeout.
 	IdleTimeout time.Duration
+
+	// MaxConcurrentQueries limits concurrent queries across all connections.
+	// 0 or negative means defaultMaxConcurrentQueries.
+	MaxConcurrentQueries int
 }
 
 // ServeTCP starts a server at l. It returns if l had an Accept() error.
@@ -61,6 +67,12 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 	if idleTimeout < firstReadTimeout {
 		firstReadTimeout = idleTimeout
 	}
+
+	maxConcurrent := opts.MaxConcurrentQueries
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrentQueries
+	}
+	sem := make(chan struct{}, maxConcurrent)
 
 	listenerCtx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(errListenerCtxCanceled)
@@ -100,6 +112,25 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 
 				// handle query
 				go func() {
+					// 非阻塞获取信号量，防止 goroutine 无限增长
+					select {
+					case sem <- struct{}{}:
+					default:
+						// 达到并发上限，快速拒绝
+						resp := new(dns.Msg)
+						resp.SetReply(req)
+						resp.Rcode = dns.RcodeServerFailure
+						resp.RecursionAvailable = true
+						payload, _ := pool.PackTCPBuffer(resp)
+						if payload != nil {
+							writeMu.Lock()
+							_, _ = c.Write(*payload)
+							writeMu.Unlock()
+							pool.ReleaseBuf(payload)
+						}
+						return
+					}
+
 					var clientAddr netip.Addr
 					ta, ok := c.RemoteAddr().(*net.TCPAddr)
 					if ok {
@@ -107,16 +138,21 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 					}
 					r := h.Handle(tcpConnCtx, req, QueryMeta{ClientAddr: clientAddr, ServerName: serverName, Protocol: proto}, pool.PackTCPBuffer)
 					if r == nil {
-						c.Close() // abort the connection
+						<-sem // 释放信号量
+						// EntryHandler 返回 nil 说明查询不合法或内部打包错误。
+						// 跳过该查询的响应，但不关闭整个连接，避免影响同连接上其他正在处理的查询。
 						return
 					}
+					// 用 defer 归还信号量，Handle 内 panic 时也能归还，避免并发名额永久泄漏。
+					defer func() { <-sem }()
 					defer pool.ReleaseBuf(r)
 
 					writeMu.Lock()
 					_, err := c.Write(*r)
 					writeMu.Unlock()
 					if err != nil {
-						logger.Warn("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
+						// 连接已断开时的写失败是预期行为，降为 Debug 避免日志噪音
+						logger.Debug("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
 						return
 					}
 				}()

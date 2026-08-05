@@ -3,21 +3,17 @@ package tiered_cache
 import (
 	"context"
 	"fmt"
-	"strings"
-	"time"
+	"sync"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/cache"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
-	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 )
 
 const PluginType = "tiered_cache"
-
-const defaultAsyncUpdateTimeout = time.Second * 5
-const defaultRetryCount = 1
 
 func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
@@ -26,9 +22,8 @@ func init() {
 var _ sequence.RecursiveExecutable = (*TieredCache)(nil)
 
 type Args struct {
-	L1Tag      string `yaml:"l1_tag"`
-	L2Tag      string `yaml:"l2_tag"`
-	RetryCount int    `yaml:"retry_count"`
+	L1Tag string `yaml:"l1_tag"`
+	L2Tag string `yaml:"l2_tag"`
 }
 
 type dnsCacher interface {
@@ -43,6 +38,12 @@ type TieredCache struct {
 	args *Args
 
 	lazyUpdateSF singleflight.Group
+	closeOnce    sync.Once
+	closeNotify  chan struct{}
+
+	// asyncCtx 用于异步更新 goroutine，Close 时取消以终止残余 goroutine。
+	asyncCtx    context.Context
+	asyncCancel context.CancelFunc
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -56,9 +57,6 @@ func NewTieredCache(bp *coremain.BP, args *Args) (*TieredCache, error) {
 	}
 	if len(args.L2Tag) == 0 {
 		return nil, fmt.Errorf("l2_tag is required")
-	}
-	if args.RetryCount <= 0 {
-		args.RetryCount = defaultRetryCount
 	}
 
 	p1 := bp.M().GetPlugin(args.L1Tag)
@@ -79,19 +77,27 @@ func NewTieredCache(bp *coremain.BP, args *Args) (*TieredCache, error) {
 		return nil, fmt.Errorf("plugin [%s] does not implement cache interface", args.L2Tag)
 	}
 
-	return &TieredCache{
-		l1:   l1,
-		l2:   l2,
-		bp:   bp,
-		args: args,
-	}, nil
+	t := &TieredCache{
+		l1:          l1,
+		l2:          l2,
+		bp:          bp,
+		args:        args,
+		closeNotify: make(chan struct{}),
+	}
+	t.asyncCtx, t.asyncCancel = context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-t.closeNotify:
+			t.asyncCancel()
+		case <-t.asyncCtx.Done():
+		}
+	}()
+	return t, nil
 }
 
-func (t *TieredCache) queryKey(q *dns.Msg) string {
-	if len(q.Question) == 0 {
-		return ""
-	}
-	return fmt.Sprintf("%s|%d|%d", strings.ToLower(q.Question[0].Name), q.Question[0].Qtype, q.Question[0].Qclass)
+// getMsgKey 生成用于 singleflight 去重的 key。
+func (t *TieredCache) getMsgKey(q *dns.Msg) string {
+	return cache.MsgQuestionKey(q, ":", "")
 }
 
 func (t *TieredCache) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
@@ -109,7 +115,7 @@ func (t *TieredCache) Exec(ctx context.Context, qCtx *query_context.Context, nex
 		qCtx.CacheHit = true
 		qCtx.CacheName = t.bp.Tag() + " -> " + t.args.L1Tag
 		if lazyHit {
-			t.asyncUpdate(q, next)
+			t.asyncUpdate(q, qCtx, next)
 		}
 		err := next.ExecNext(ctx, qCtx)
 		if qCtx.GetBlackHoleTag() == "" {
@@ -126,7 +132,7 @@ func (t *TieredCache) Exec(ctx context.Context, qCtx *query_context.Context, nex
 		qCtx.CacheHit = true
 		qCtx.CacheName = t.bp.Tag() + " -> " + t.args.L2Tag
 		if lazyHit {
-			t.asyncUpdate(q, next)
+			t.asyncUpdate(q, qCtx, next)
 		}
 		err := next.ExecNext(ctx, qCtx)
 		if qCtx.GetBlackHoleTag() == "" {
@@ -137,65 +143,54 @@ func (t *TieredCache) Exec(ctx context.Context, qCtx *query_context.Context, nex
 
 	err := next.ExecNext(ctx, qCtx)
 
+	if err != nil {
+		return err
+	}
+
 	if qCtx.GetBlackHoleTag() == "" {
 		qCtx.CacheHit = false
 		query_context.RecordCache(false)
 		if qCtx.R() != nil {
 			t.l1.StoreDns(q, qCtx.R())
-			t.l2.StoreDns(q, qCtx.R())
+			// L2 (Redis) 存储异步执行，避免慢 Redis 阻塞请求链。
+			// 传入深拷贝避免异步 goroutine 与主 goroutine 竞争。
+			// StoreDns 内部有自己的 2 秒超时，无需额外 ctx。
+			qCopy := q.Copy()
+			rCopy := qCtx.R().Copy()
+			go t.l2.StoreDns(qCopy, rCopy)
 		}
 	}
 
-	return err
+	return nil
 }
 
-func (t *TieredCache) asyncUpdate(q *dns.Msg, next sequence.ChainWalker) {
-	key := t.queryKey(q)
+// asyncUpdate 复用 cache.LazyUpdate 执行异步更新，与 redis_cache/memory_cache 保持一致。
+// 使用 singleflight 去重，更新结果同时写入 L1 和 L2。
+func (t *TieredCache) asyncUpdate(q *dns.Msg, qCtx *query_context.Context, next sequence.ChainWalker) {
+	key := t.getMsgKey(q)
 	if key == "" {
 		return
 	}
 
-	qCopy := q.Copy()
-	lazyUpdateFunc := func() (any, error) {
-		defer t.lazyUpdateSF.Forget(key)
+	cache.LazyUpdate(
+		t.asyncCtx,
+		&t.lazyUpdateSF,
+		t.bp.L(),
+		key,
+		qCtx,
+		&next,
+		func(r *dns.Msg) {
+			qCopy := q.Copy()
+			t.l1.StoreDns(qCopy, r)
+			t.l2.StoreDns(qCopy, r)
+		},
+	)
+}
 
-		var lastErr error
-		for i := 0; i <= t.args.RetryCount; i++ {
-			if i > 0 {
-				time.Sleep(time.Duration(100*(1<<uint(i-1))) * time.Millisecond)
-			}
-
-			retryCtx, retryCancel := context.WithTimeout(context.Background(), defaultAsyncUpdateTimeout)
-			retryNext := next
-			qCtx := query_context.NewContext(qCopy)
-			err := retryNext.ExecNext(retryCtx, qCtx)
-			retryCancel()
-			if err != nil {
-				lastErr = err
-				t.bp.L().Warn("tiered_cache 异步更新失败",
-					zap.String("query", q.Question[0].String()),
-					zap.Int("attempt", i+1),
-					zap.Error(err),
-				)
-				continue
-			}
-			if r := qCtx.R(); r != nil {
-				t.l1.StoreDns(qCopy, r)
-				t.l2.StoreDns(qCopy, r)
-				lastErr = nil
-				break
-			}
-		}
-
-		if lastErr != nil {
-			t.bp.L().Error("tiered_cache 异步更新重试耗尽",
-				zap.String("query", q.Question[0].String()),
-				zap.Int("retry_count", t.args.RetryCount),
-				zap.Error(lastErr),
-			)
-		}
-		return nil, lastErr
-	}
-
-	t.lazyUpdateSF.DoChan(key, lazyUpdateFunc)
+// Close 通知异步更新 goroutine 停止，释放资源。
+func (t *TieredCache) Close() error {
+	t.closeOnce.Do(func() {
+		close(t.closeNotify)
+	})
+	return nil
 }

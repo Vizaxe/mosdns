@@ -53,7 +53,8 @@ func NewLRU[K comparable, V any](maxSize int, onEvict func(key K, v V)) *LRU[K, 
 func (q *LRU[K, V]) Add(key K, v V) {
 	if e, ok := q.m[key]; ok { // update existed key
 		e.Value.v = v
-		q.l.PushBack(q.l.PopElem(e))
+		newElem := q.l.PushBack(q.l.PopElem(e))
+		q.m[key] = newElem
 		return
 	}
 

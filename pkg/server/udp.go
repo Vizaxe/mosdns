@@ -32,6 +32,10 @@ import (
 
 type UDPServerOpts struct {
 	Logger *zap.Logger
+
+	// MaxConcurrentQueries limits concurrent queries across all connections.
+	// 0 or negative means defaultMaxConcurrentQueries.
+	MaxConcurrentQueries int
 }
 
 // ServeUDP starts a server at c. It returns if c had a read error.
@@ -42,6 +46,12 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 	if logger == nil {
 		logger = nopLogger
 	}
+
+	maxConcurrent := opts.MaxConcurrentQueries
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrentQueries
+	}
+	sem := make(chan struct{}, maxConcurrent)
 
 	listenerCtx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(errListenerCtxCanceled)
@@ -87,8 +97,17 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 			}
 		}
 
+		// 非阻塞获取信号量，超过并发上限时丢弃请求
+		select {
+		case sem <- struct{}{}:
+		default:
+			logger.Warn("too many concurrent queries, drop", zap.Stringer("from", remoteAddr))
+			continue
+		}
+
 		// handle query
 		go func() {
+			defer func() { <-sem }()
 			payload := h.Handle(listenerCtx, q, QueryMeta{ClientAddr: remoteAddr.Addr(), Protocol: "UDP"}, pool.PackBuffer)
 			if payload == nil {
 				return
@@ -100,7 +119,7 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 				oob = oobWriter(dstIpFromCm)
 			}
 			if _, _, err := c.WriteMsgUDPAddrPort(*payload, oob, remoteAddr); err != nil {
-				logger.Warn("failed to write response", zap.Stringer("client", remoteAddr), zap.Error(err))
+				logger.Debug("failed to write response", zap.Stringer("client", remoteAddr), zap.Error(err))
 			}
 		}()
 	}
@@ -117,6 +136,12 @@ func ServeUnix(c *net.UnixConn, h Handler, opts UDPServerOpts) error {
 	if logger == nil {
 		logger = nopLogger
 	}
+
+	maxConcurrent := opts.MaxConcurrentQueries
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrentQueries
+	}
+	sem := make(chan struct{}, maxConcurrent)
 
 	listenerCtx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(errListenerCtxCanceled)
@@ -148,8 +173,16 @@ func ServeUnix(c *net.UnixConn, h Handler, opts UDPServerOpts) error {
 			continue
 		}
 
+		select {
+		case sem <- struct{}{}:
+		default:
+			logger.Warn("too many concurrent queries, drop", zap.Stringer("from", addr))
+			continue
+		}
+
 		// handle query
 		go func() {
+			defer func() { <-sem }()
 			payload := h.Handle(listenerCtx, q, QueryMeta{ClientAddr: netip.Addr{}, Protocol: "unixgram"}, pool.PackBuffer)
 			if payload == nil {
 				return

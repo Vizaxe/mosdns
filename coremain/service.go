@@ -64,6 +64,9 @@ func (ss *serverService) Start(s service.Service) error {
 }
 
 func (ss *serverService) Stop(_ service.Service) error {
+	if ss.m == nil {
+		return nil
+	}
 	ss.m.Logger().Info("service is shutting down")
 	ss.m.GetSafeClose().SendCloseSignal(nil)
 	return ss.m.GetSafeClose().WaitClosed()
@@ -90,9 +93,8 @@ func newSvcInstallCmd() *cobra.Command {
 				absWd, err := filepath.Abs(sf.dir)
 				if err != nil {
 					return fmt.Errorf("cannot solve absolute working dir path, %w", err)
-				} else {
-					sf.dir = absWd
 				}
+				sf.dir = absWd
 			} else {
 				ep, err := os.Executable()
 				if err != nil {

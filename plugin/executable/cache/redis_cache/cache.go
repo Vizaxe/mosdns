@@ -57,7 +57,7 @@ type Args struct {
 }
 
 func (a *Args) init() {
-	if &a.Separator == nil || len(a.Separator) == 0 {
+	if len(a.Separator) == 0 {
 		a.Separator = ":"
 	}
 }
@@ -72,6 +72,11 @@ type RedisCache struct {
 	closeOnce    sync.Once
 	closeNotify  chan struct{}
 	updatedKey   atomic.Uint64
+
+	// asyncCtx 用于异步 lazy update goroutine，Close 时取消以终止残余 goroutine。
+	// 初始化时创建一次，避免每次 doLazyUpdate 都创建 context + 监控 goroutine 造成泄漏。
+	asyncCtx    context.Context
+	asyncCancel context.CancelFunc
 
 	queryTotal   prometheus.Counter
 	hitTotal     prometheus.Counter
@@ -132,6 +137,14 @@ func NewRedisCache(args *Args, tag string, logger *zap.Logger) (*RedisCache, err
 			return float64(backend.Len())
 		}),
 	}
+	p.asyncCtx, p.asyncCancel = context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-p.closeNotify:
+			p.asyncCancel()
+		case <-p.asyncCtx.Done():
+		}
+	}()
 
 	return p, nil
 }
@@ -153,7 +166,7 @@ func (c *RedisCache) Exec(ctx context.Context, qCtx *query_context.Context, next
 	qCtx.CacheQueried = true
 	wasHit := false
 	if c.args.StoreOnly {
-		c.logger.Debug("cache hit but store only, will query upstream and update cache", zap.Any("query", qCtx), zap.Any("resp", &cachedResp))
+		c.logger.Debug("store only mode, skip cache lookup")
 	} else {
 		cachedResp, lazyHit := c.getRespFromCache(msgKey, c.args.LazyCacheTTL > 0 || c.args.LazyCacheTTL == redis.KeepTTL, cache_backend.ExpiredMsgTtl)
 		if cachedResp != nil {
@@ -161,10 +174,10 @@ func (c *RedisCache) Exec(ctx context.Context, qCtx *query_context.Context, next
 			wasHit = true
 			if lazyHit {
 				c.lazyHitTotal.Inc()
-				c.logger.Debug("lazy cache hit ", zap.Any("query", qCtx), zap.Any("resp", &cachedResp))
+				c.logger.Debug("lazy cache hit", qCtx.InfoField(), zap.Int("rcode", cachedResp.Rcode), zap.Int("answers", len(cachedResp.Answer)))
 				c.doLazyUpdate(msgKey, qCtx, next)
 			} else {
-				c.logger.Debug("cache hit ", zap.Any("query", qCtx), zap.Any("resp", &cachedResp))
+				c.logger.Debug("cache hit", qCtx.InfoField(), zap.Int("rcode", cachedResp.Rcode), zap.Int("answers", len(cachedResp.Answer)))
 			}
 			cachedResp.Id = q.Id // change msg id
 			qCtx.SetResponse(cachedResp)

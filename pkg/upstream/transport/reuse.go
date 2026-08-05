@@ -314,6 +314,10 @@ func (c *reusableConn) exchange(ctx context.Context, q *[]byte) (*[]byte, error)
 	case <-c.closeNotify:
 		return nil, c.closeErr
 	case <-ctx.Done():
+		// ctx 被取消（通常是客户端断开或查询超时）。
+		// 主动关闭连接，避免连接在 SetDeadline 超时前成为"僵尸"：
+		// 既不在 idleConns 池中，readLoop 又在阻塞等待上游响应，占用 fd 和 goroutine。
+		c.closeWithErr(context.Cause(ctx))
 		return nil, context.Cause(ctx)
 	}
 }

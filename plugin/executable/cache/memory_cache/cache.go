@@ -46,7 +46,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
-	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -59,8 +58,7 @@ func init() {
 }
 
 const (
-	defaultLazyUpdateTimeout = time.Second * 5
-	expiredMsgTtl            = 5
+	expiredMsgTtl = 5
 
 	minimumChangesToDump   = 1024
 	dumpHeader             = "mosdns_cache_v2"
@@ -75,11 +73,16 @@ type Args struct {
 	LazyCacheTTL int    `yaml:"lazy_cache_ttl"`
 	DumpFile     string `yaml:"dump_file"`
 	DumpInterval int    `yaml:"dump_interval"`
+	EdnsKey      *bool  `yaml:"edns_key"`
 }
 
 func (a *Args) init() {
 	utils.SetDefaultUnsignNum(&a.Size, 1024)
 	utils.SetDefaultUnsignNum(&a.DumpInterval, 600)
+	if a.EdnsKey == nil {
+		v := true
+		a.EdnsKey = &v
+	}
 }
 
 type MemoryCache struct {
@@ -92,6 +95,10 @@ type MemoryCache struct {
 	closeOnce    sync.Once
 	closeNotify  chan struct{}
 	updatedKey   atomic.Uint64
+
+	// asyncCtx 用于异步 lazy update goroutine，Close 时取消以终止残余 goroutine。
+	asyncCtx    context.Context
+	asyncCancel context.CancelFunc
 
 	queryTotal   prometheus.Counter
 	hitTotal     prometheus.Counter
@@ -175,6 +182,15 @@ func NewMemoryCache(args *Args, opts Opts) *MemoryCache {
 		}),
 	}
 
+	p.asyncCtx, p.asyncCancel = context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-p.closeNotify:
+			p.asyncCancel()
+		case <-p.asyncCtx.Done():
+		}
+	}()
+
 	if err := p.loadDump(); err != nil {
 		p.logger.Error("failed to load cache dump", zap.Error(err))
 	}
@@ -200,7 +216,10 @@ func (c *MemoryCache) Exec(ctx context.Context, qCtx *query_context.Context, nex
 	c.queryTotal.Inc()
 	q := qCtx.Q()
 
-	msgKey := getMsgKey(q)
+	// 统一走 getKey，保证 edns_key 配置在 Exec 路径同样生效，
+	// 否则 edns_key: false 时 Exec 仍生成含 EDNS 标志的 key，
+	// 与 QueryDns/StoreDns 的 key 不一致，导致缓存失效。
+	msgKey := c.getKey(q)
 	if len(msgKey) == 0 { // skip cache
 		return next.ExecNext(ctx, qCtx)
 	}
@@ -238,32 +257,21 @@ func (c *MemoryCache) Exec(ctx context.Context, qCtx *query_context.Context, nex
 	return err
 }
 
-// doLazyUpdate starts a new goroutine to execute next node and update the cache in the background.
-// It has an inner singleflight.Group to de-duplicate same msgKey.
+// doLazyUpdate 异步执行 next 链并更新缓存。
+// 使用结构体级别的 asyncCtx，避免每次调用都创建 context + 监控 goroutine 造成泄漏。
 func (c *MemoryCache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next sequence.ChainWalker) {
-	qCtxCopy := qCtx.Copy()
-	lazyUpdateFunc := func() (any, error) {
-		defer c.lazyUpdateSF.Forget(msgKey)
-		qCtx := qCtxCopy
-
-		c.logger.Debug("start lazy cache update", qCtx.InfoField())
-		ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
-		defer cancel()
-
-		err := next.ExecNext(ctx, qCtx)
-		if err != nil {
-			c.logger.Warn("failed to update lazy cache", qCtx.InfoField(), zap.Error(err))
-		}
-
-		r := qCtx.R()
-		if r != nil {
+	cache.LazyUpdate(
+		c.asyncCtx,
+		&c.lazyUpdateSF,
+		c.logger,
+		msgKey,
+		qCtx,
+		&next,
+		func(r *dns.Msg) {
 			saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL)
 			c.updatedKey.Add(1)
-		}
-		c.logger.Debug("lazy cache updated", qCtx.InfoField())
-		return nil, nil
-	}
-	c.lazyUpdateSF.DoChan(msgKey, lazyUpdateFunc) // DoChan won't block this goroutine
+		},
+	)
 }
 
 func (c *MemoryCache) loadDump() error {
@@ -361,10 +369,16 @@ func (c *MemoryCache) writeDump(w io.Writer) (int, error) {
 
 	gw, _ := gzip.NewWriterLevel(w, gzip.BestSpeed)
 	gw.Name = dumpHeader
+	gwClosed := false
+	defer func() {
+		if !gwClosed {
+			_ = gw.Close()
+		}
+	}()
 
-	block := new(CacheDumpBlock)
+	block := new(cache.CacheDumpBlock)
 	writeBlock := func() error {
-		b, err := proto.Marshal(block)
+		b, err := block.Marshal()
 		if err != nil {
 			return fmt.Errorf("failed to marshal protobuf, %w", err)
 		}
@@ -394,10 +408,10 @@ func (c *MemoryCache) writeDump(w io.Writer) (int, error) {
 		if err != nil {
 			return fmt.Errorf("failed to pack msg, %w", err)
 		}
-		e := &CachedEntry{
+		e := &cache.CachedEntry{
 			Key:                 []byte(k),
 			CacheExpirationTime: cacheExpirationTime.Unix(),
-			MsgExpirationTime:   v.ExpirationTime.Unix(),
+			ExpirationTime:      v.ExpirationTime.Unix(),
 			Msg:                 msg,
 		}
 		block.Entries = append(block.Entries, e)
@@ -417,6 +431,7 @@ func (c *MemoryCache) writeDump(w io.Writer) (int, error) {
 			return en, err
 		}
 	}
+	gwClosed = true
 	return en, gw.Close()
 }
 
@@ -431,6 +446,12 @@ func (c *MemoryCache) readDump(r io.Reader) (int, error) {
 	if gr.Name != dumpHeader {
 		return en, fmt.Errorf("invalid or old cache dump, header is %s, want %s", gr.Name, dumpHeader)
 	}
+	grClosed := false
+	defer func() {
+		if !grClosed {
+			_ = gr.Close()
+		}
+	}()
 
 	var errReadHeaderEOF = errors.New("")
 	readBlock := func() error {
@@ -455,18 +476,18 @@ func (c *MemoryCache) readDump(r io.Reader) (int, error) {
 			return fmt.Errorf("failed to read block data, %w", err)
 		}
 
-		block := new(CacheDumpBlock)
-		if err := proto.Unmarshal(*b, block); err != nil {
+		block := new(cache.CacheDumpBlock)
+		if err := block.Unmarshal(*b); err != nil {
 			return fmt.Errorf("failed to decode block data, %w", err)
 		}
 
 		en += len(block.GetEntries())
 		for _, entry := range block.GetEntries() {
-			cacheExpTime := time.Unix(entry.GetCacheExpirationTime(), 0)
-			msgExpTime := time.Unix(entry.GetMsgExpirationTime(), 0)
-			storedTime := time.Unix(entry.GetMsgStoredTime(), 0)
+			cacheExpTime := time.Unix(entry.CacheExpirationTime, 0)
+			msgExpTime := time.Unix(entry.ExpirationTime, 0)
+			storedTime := time.Unix(entry.StoredTime, 0)
 			resp := new(dns.Msg)
-			if err := resp.Unpack(entry.GetMsg()); err != nil {
+			if err := resp.Unpack(entry.Msg); err != nil {
 				return fmt.Errorf("failed to decode dns msg, %w", err)
 			}
 
@@ -475,7 +496,7 @@ func (c *MemoryCache) readDump(r io.Reader) (int, error) {
 				StoredTime:     storedTime,
 				ExpirationTime: msgExpTime,
 			}
-			c.backend.Store(key(entry.GetKey()), i, time.Now().Sub(cacheExpTime))
+			c.backend.Store(key(entry.Key), i, time.Now().Sub(cacheExpTime))
 		}
 		return nil
 	}
@@ -493,5 +514,6 @@ func (c *MemoryCache) readDump(r io.Reader) (int, error) {
 	if err != nil {
 		return en, err
 	}
+	grClosed = true
 	return en, gr.Close()
 }

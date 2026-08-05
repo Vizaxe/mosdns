@@ -93,7 +93,11 @@ func NewMatchBlackHole(bp *coremain.BP, args *Args) (*MatchBlackHole, error) {
 	}
 
 	if len(args.BlackHoleSet) > 0 {
-		p.blackHole = bp.M().GetPlugin(args.BlackHoleSet).(*black_hole.BlackHole)
+		bh, ok := bp.M().GetPlugin(args.BlackHoleSet).(*black_hole.BlackHole)
+		if !ok {
+			return nil, fmt.Errorf("%s is not a BlackHole plugin", args.BlackHoleSet)
+		}
+		p.blackHole = bh
 	} else {
 		blackHole, err := black_hole.NewBlackHole(bp.L(), bp.Tag()+"@black_hole", &black_hole.Args{
 			Ips:   args.BlackHoleIPs,
@@ -113,7 +117,9 @@ func (b *MatchBlackHole) Exec(ctx context.Context, qCtx *query_context.Context) 
 	if b.matchesCName(qCtx, b.dm) || b.matchesRespAddr(qCtx, b.nm) {
 		or := qCtx.R()
 		if r := b.blackHole.Response(qCtx.Q()); r != nil {
-			b.logger.Info("result change", zap.Any("query", qCtx), zap.Any("source resp", or), zap.Any("dest resp", r))
+			b.logger.Debug("result change", qCtx.InfoField(),
+				zap.Int("orig_rcode", origRcode(or)),
+				zap.Int("new_rcode", r.Rcode))
 			if or := qCtx.R(); or != nil {
 				qCtx.SetBlackHoleOrigResp(or)
 			}
@@ -122,6 +128,14 @@ func (b *MatchBlackHole) Exec(ctx context.Context, qCtx *query_context.Context) 
 		}
 	}
 	return nil
+}
+
+// origRcode 安全获取 response 的 Rcode，nil 时返回 -1。
+func origRcode(r *dns.Msg) int {
+	if r == nil {
+		return -1
+	}
+	return r.Rcode
 }
 
 func (b *MatchBlackHole) matchesRespAddr(qCtx *query_context.Context, ms []netlist.Matcher) bool {

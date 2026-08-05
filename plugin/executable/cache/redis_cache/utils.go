@@ -20,9 +20,6 @@
 package redis_cache
 
 import (
-	"fmt"
-	"strings"
-
 	"github.com/IrineSistiana/mosdns/v5/pkg/cache_backend"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/cache"
 	"github.com/miekg/dns"
@@ -31,10 +28,5 @@ import (
 var _ cache.Cache[cache_backend.StringKey, string] = (*RedisCache)(nil)
 
 func getMsgKey(q *dns.Msg, separator string, prefix string) string {
-	question := q.Question[0]
-	if len(strings.TrimSpace(prefix)) > 0 {
-		return fmt.Sprintf("%s%s%s%s%s%s%s", prefix, separator, dns.TypeToString[question.Qtype], separator, dns.ClassToString[question.Qclass], separator, question.Name)
-	} else {
-		return fmt.Sprintf("%s%s%s%s%s", dns.TypeToString[question.Qtype], separator, dns.ClassToString[question.Qclass], separator, question.Name)
-	}
+	return cache.MsgQuestionKey(q, separator, prefix)
 }

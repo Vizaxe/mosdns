@@ -28,6 +28,7 @@ import (
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 	"go.uber.org/zap"
 )
@@ -39,8 +40,15 @@ const (
 )
 
 type DoQServerOpts struct {
-	Logger      *zap.Logger
+	Logger *zap.Logger
+
+	// IdleTimeout controls the maximum idle time for each connection.
+	// Default is defaultQuicIdleTimeout.
 	IdleTimeout time.Duration
+
+	// MaxConcurrentQueries limits concurrent queries across all connections.
+	// 0 or negative means defaultMaxConcurrentQueries.
+	MaxConcurrentQueries int
 }
 
 // ServeDoQ starts a server at l. It returns if l had an Accept() error.
@@ -54,6 +62,12 @@ func ServeDoQ(l *quic.Listener, h Handler, opts DoQServerOpts) error {
 	if idleTimeout <= 0 {
 		idleTimeout = defaultQuicIdleTimeout
 	}
+
+	maxConcurrent := opts.MaxConcurrentQueries
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrentQueries
+	}
+	sem := make(chan struct{}, maxConcurrent)
 
 	listenerCtx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(errListenerCtxCanceled)
@@ -98,12 +112,32 @@ func ServeDoQ(l *quic.Listener, h Handler, opts DoQServerOpts) error {
 						stream.Close()
 						stream.CancelRead(0) // TODO: Needs a proper error code.
 					}()
+
 					// Avoid fragmentation attack.
 					stream.SetReadDeadline(time.Now().Add(streamReadTimeout))
 					req, _, err := dnsutils.ReadMsgFromTCP(stream)
 					if err != nil {
 						return
 					}
+
+					// 非阻塞获取信号量，防止 goroutine 无限增长
+					select {
+					case sem <- struct{}{}:
+					default:
+						// 达到并发上限，快速拒绝
+						resp := new(dns.Msg)
+						resp.SetReply(req)
+						resp.Rcode = dns.RcodeServerFailure
+						resp.RecursionAvailable = true
+						payload, _ := pool.PackTCPBuffer(resp)
+						if payload != nil {
+							_, _ = stream.Write(*payload)
+							pool.ReleaseBuf(payload)
+						}
+						return
+					}
+					defer func() { <-sem }()
+
 					queryMeta := QueryMeta{
 						ClientAddr: clientAddr,
 						ServerName: c.ConnectionState().TLS.ServerName,
@@ -114,8 +148,9 @@ func ServeDoQ(l *quic.Listener, h Handler, opts DoQServerOpts) error {
 					if resp == nil {
 						return
 					}
+					defer pool.ReleaseBuf(resp)
 					if _, err := stream.Write(*resp); err != nil {
-						logger.Warn("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
+						logger.Debug("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
 					}
 				}()
 			}

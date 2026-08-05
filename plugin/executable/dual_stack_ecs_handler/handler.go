@@ -100,7 +100,9 @@ func Init(_ *coremain.BP, args any) (any, error) {
 
 // Exec tries to append ECS to qCtx.Q().
 func (e *ECSHandler) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
-	e.addECS(qCtx)
+	if err := e.addECS(qCtx); err != nil {
+		return err
+	}
 	err := next.ExecNext(ctx, qCtx)
 	if err != nil {
 		return err
@@ -110,39 +112,52 @@ func (e *ECSHandler) Exec(ctx context.Context, qCtx *query_context.Context, next
 }
 
 // AddECS adds a *dns.EDNS0_SUBNET record to q.
-func (e *ECSHandler) addECS(qCtx *query_context.Context) {
+func (e *ECSHandler) addECS(qCtx *query_context.Context) error {
 	queryOpt := qCtx.QOpt()
 
 	// Check if query already has an ecs.
 	for _, o := range queryOpt.Option {
 		if o.Option() == dns.EDNS0SUBNET {
 			// skip it
-			return
+			return nil
 		}
 	}
 
 	if qCtx.QQuestion().Qclass != dns.ClassINET {
 		// RFC 7871 5:
 		// ECS is only defined for the Internet (IN) DNS class.
-		return
+		return nil
 	}
 
 	qtype := qCtx.QQuestion().Qtype
 
 	if qtype == dns.TypeA {
-		ecs := newSubnet(e.ipv4Preset.AsSlice(), uint8(e.args.Mask4), false)
+		ecs, err := newSubnet(e.ipv4Preset.AsSlice(), uint8(e.args.Mask4), false)
+		if err != nil {
+			return err
+		}
 		queryOpt.Option = append(queryOpt.Option, ecs)
 	} else if qtype == dns.TypeAAAA {
-		ecs := newSubnet(e.ipv6Preset.AsSlice(), uint8(e.args.Mask6), true)
+		ecs, err := newSubnet(e.ipv6Preset.AsSlice(), uint8(e.args.Mask6), true)
+		if err != nil {
+			return err
+		}
 		queryOpt.Option = append(queryOpt.Option, ecs)
 	} else {
-		ecs1 := newSubnet(e.ipv4Preset.AsSlice(), uint8(e.args.Mask4), false)
-		ecs2 := newSubnet(e.ipv6Preset.AsSlice(), uint8(e.args.Mask6), true)
+		ecs1, err := newSubnet(e.ipv4Preset.AsSlice(), uint8(e.args.Mask4), false)
+		if err != nil {
+			return err
+		}
+		ecs2, err := newSubnet(e.ipv6Preset.AsSlice(), uint8(e.args.Mask6), true)
+		if err != nil {
+			return err
+		}
 		queryOpt.Option = append(queryOpt.Option, ecs1, ecs2)
 	}
+	return nil
 }
 
-func newSubnet(ip net.IP, mask uint8, v6 bool) *dns.EDNS0_SUBNET {
+func newSubnet(ip net.IP, mask uint8, v6 bool) (*dns.EDNS0_SUBNET, error) {
 	edns0Subnet := new(dns.EDNS0_SUBNET)
 	// edns family: https://www.iana.org/assignments/address-family-numbers/address-family-numbers.xhtml
 	// ipv4 = 1
@@ -153,11 +168,13 @@ func newSubnet(ip net.IP, mask uint8, v6 bool) *dns.EDNS0_SUBNET {
 		edns0Subnet.Family = 2
 	}
 
-	_, ipNet, _ := net.ParseCIDR(fmt.Sprintf("%s/%d", ip.String(), mask))
+	_, ipNet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", ip.String(), mask))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse ecs subnet %s/%d: %w", ip.String(), mask, err)
+	}
 
 	edns0Subnet.SourceNetmask = mask
 	edns0Subnet.Code = dns.EDNS0SUBNET
-	//edns0Subnet.Address = ip
 	edns0Subnet.Address = ipNet.IP
 
 	// SCOPE PREFIX-LENGTH, an unsigned octet representing the leftmost
@@ -165,5 +182,5 @@ func newSubnet(ip net.IP, mask uint8, v6 bool) *dns.EDNS0_SUBNET {
 	// In queries, it MUST be set to 0.
 	// https://tools.ietf.org/html/rfc7871
 	edns0Subnet.SourceScope = 0
-	return edns0Subnet
+	return edns0Subnet, nil
 }

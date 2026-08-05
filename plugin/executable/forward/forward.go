@@ -237,16 +237,16 @@ func (f *Forward) Close() error {
 	return nil
 }
 
+type exchangeResult struct {
+	r     *dns.Msg
+	err   error
+	upDur time.Duration
+}
+
 func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us []*upstreamWrapper) (*dns.Msg, error) {
 	if len(us) == 0 {
 		return nil, errors.New("no upstream to exchange")
 	}
-
-	queryPayload, err := pool.PackBuffer(qCtx.Q())
-	if err != nil {
-		return nil, err
-	}
-	defer pool.ReleaseBuf(queryPayload)
 
 	concurrent := f.args.Concurrent
 	if concurrent <= 0 {
@@ -256,19 +256,11 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 		concurrent = maxConcurrentQueries
 	}
 
-	type res struct {
-		r     *dns.Msg
-		err   error
-		upDur time.Duration
-	}
-
 	qName := qCtx.QQuestion().Name
 	qClass := qCtx.QQuestion().Qclass
 	qType := qCtx.QQuestion().Qtype
 
-	resChan := make(chan res, concurrent)
-	done := make(chan struct{})
-	defer close(done)
+	resChan := make(chan exchangeResult, concurrent)
 
 	r := rand.IntN(len(us))
 	for i := 0; i < concurrent; i++ {
@@ -277,8 +269,15 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 			upstreamCtx, cancel := context.WithTimeout(ctx, queryTimeout)
 			defer cancel()
 
+			queryPayload, err := pool.PackBuffer(qCtx.Q())
+			if err != nil {
+				resChan <- exchangeResult{err: err}
+				return
+			}
+
 			start := time.Now()
 			respPayload, err := u.ExchangeContext(upstreamCtx, *queryPayload)
+			pool.ReleaseBuf(queryPayload)
 			upDur := time.Since(start)
 			var resp *dns.Msg
 			if err != nil {
@@ -299,13 +298,18 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 				}
 				pool.ReleaseBuf(respPayload)
 			}
+
 			select {
-			case resChan <- res{r: resp, err: err, upDur: upDur}:
-			case <-done:
+			case resChan <- exchangeResult{r: resp, err: err, upDur: upDur}:
+			case <-ctx.Done():
 			}
 		}(u)
 	}
 
+	return f.collectResults(ctx, qCtx, concurrent, resChan)
+}
+
+func (f *Forward) collectResults(ctx context.Context, qCtx *query_context.Context, concurrent int, resChan chan exchangeResult) (*dns.Msg, error) {
 	var lastErr error
 	for i := 0; i < concurrent; i++ {
 		select {

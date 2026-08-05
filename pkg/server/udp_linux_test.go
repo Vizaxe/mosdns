@@ -9,67 +9,78 @@ import (
 )
 
 func TestIsPacketConn(t *testing.T) {
-	// UDP
-	//c, err := net.Dial("unixgram", "/tmp/udp.sock")
-	//if err != nil {
-	//	t.Fatalf("failed to dial: %v", err)
-	//}
-	//defer c.Close()
-	//if !isPacketConn(c) {
-	//	t.Error("Unix datagram connection should be a packet conn")
-	//}
-	//if !isPacketConn(struct{ *net.UnixConn }{c.(*net.UnixConn)}) {
-	//	t.Error("Unix datagram connection (wrapped type) should be a packet conn")
-	//}
+	// Test isPacketConn with a unix datagram connection
+	dir := t.TempDir()
+	sockPath := dir + "/test.sock"
 
-	query("openresty.")
-	query("www.qq.com.")
+	addr, err := net.ResolveUnixAddr("unixgram", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.ListenUnixgram("unixgram", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	c, err := net.DialUnix("unixgram", &net.UnixAddr{Name: dir + "/client.sock", Net: "unixgram"}, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if !isPacketConn(c) {
+		t.Error("Unix datagram connection should be a packet conn")
+	}
+	if !isPacketConn(struct{ *net.UnixConn }{c}) {
+		t.Error("Unix datagram connection (wrapped type) should be a packet conn")
+	}
 }
 
-func query(str string) {
-	// 构建DNS请求
-	m := new(dns.Msg)
-	m.SetQuestion(str, dns.TypeA)
-	m.RecursionDesired = true
-	msg, _ := m.Pack()
-
-	fmt.Printf("query: %v\n", m)
+func TestQueryExternalSocket(t *testing.T) {
+	sockPath := os.Getenv("MOSDNS_TEST_SOCK")
+	if sockPath == "" {
+		t.Skip("MOSDNS_TEST_SOCK not set, skipping external socket test")
+	}
 
 	localSock, err := os.CreateTemp("", "mosdns-unixgram-request.sock")
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	filePath := localSock.Name()
+	localSock.Close()
 	os.Remove(filePath)
 
 	c, err := net.DialUnix("unixgram",
 		&net.UnixAddr{Name: filePath, Net: "unixgram"},
-		&net.UnixAddr{Name: "/home/rice/project/github/mosdns/udp.sock", Net: "unixgram"})
+		&net.UnixAddr{Name: sockPath, Net: "unixgram"})
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	defer c.Close()
 
+	m := new(dns.Msg)
+	m.SetQuestion("openresty.", dns.TypeA)
+	m.RecursionDesired = true
+	msg, err := m.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Printf("query: %v\n", m)
+
 	if _, err := c.Write(msg); err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 
-	// 读取DNS响应
 	in := make([]byte, 512)
-	_, err = c.Read(in)
+	n, err := c.Read(in)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 
 	resp := new(dns.Msg)
-	if err := resp.Unpack(in); err != nil {
-		panic(err)
+	if err := resp.Unpack(in[:n]); err != nil {
+		t.Fatal(err)
 	}
-
-	//i := &redis_cache.Item{
-	//	Resp: resp,
-	//}
-	//r := redis_cache.Test(*i)
-
 	fmt.Printf("DNS Response: %v\n", resp)
 }

@@ -86,6 +86,7 @@ func (l *Leases) responsePtr(m *dns.Msg) *dns.Msg {
 	}
 	var name string
 	var ttl time.Duration
+	l.mu.RLock()
 	if addr.Is4() && len(l.ipv4Leases) > 0 {
 		for i := range l.ipv4Leases {
 			lease := l.ipv4Leases[i]
@@ -115,6 +116,7 @@ func (l *Leases) responsePtr(m *dns.Msg) *dns.Msg {
 			}
 		}
 	}
+	l.mu.RUnlock()
 	if len(name) > 0 {
 		r := new(dns.Msg)
 		setDefaultVal(r)

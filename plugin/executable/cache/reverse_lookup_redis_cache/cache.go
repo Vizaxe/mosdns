@@ -68,7 +68,7 @@ type Args struct {
 }
 
 func (a *Args) init() {
-	if &a.Separator == nil || len(a.Separator) == 0 {
+	if len(a.Separator) == 0 {
 		a.Separator = ":"
 	}
 }

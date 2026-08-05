@@ -175,6 +175,13 @@ func (d *V2rayGeosite) reload() error {
 	return nil
 }
 
+func (d *V2rayGeosite) Close() error {
+	if d.cancel != nil {
+		d.cancel()
+	}
+	return nil
+}
+
 func LoadFile(file string, code string, m *domain.MixMatcher[struct{}]) error {
 	if len(file) > 0 {
 		domains, err := geofile.LoadSite(file, code)

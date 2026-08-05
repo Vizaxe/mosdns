@@ -97,55 +97,38 @@ func (u *Upstream) ExchangeContext(ctx context.Context, q []byte) (*[]byte, erro
 
 	queryLen := 4 + base64.RawURLEncoding.EncodedLen(len(wire))
 
-	type res struct {
-		r   *[]byte
-		err error
+	// Use parent context with at least defaultDoHTimeout.
+	// For HTTP/2 (which DoH uses), cancelling a request context only
+	// RST_STREAMs the single stream, NOT the entire connection.
+	// So connection reuse is preserved.
+	dohCtx, cancel := context.WithTimeout(ctx, defaultDoHTimeout)
+	defer cancel()
+
+	var r *[]byte
+	var err error
+	if queryLen > maxGetURLLen {
+		// Use POST for large queries to avoid "414 Request-URI Too Large".
+		body := make([]byte, len(wire))
+		copy(body, wire)
+		r, err = u.exchangePost(dohCtx, body)
+	} else {
+		queryBuf := make([]byte, queryLen)
+		p := 0
+		p += copy(queryBuf, "dns=")
+
+		// Padding characters for base64url MUST NOT be included.
+		// See: https://tools.ietf.org/html/rfc8484#section-6.
+		base64.RawURLEncoding.Encode(queryBuf[p:], wire)
+		r, err = u.exchange(dohCtx, utils.BytesToStringUnsafe(queryBuf))
 	}
 
-	resChan := make(chan res, 1)
-	go func() {
-		// We overwrite the ctx with a fixed timeout context here.
-		// Because the http package may close the underlay connection
-		// if the context is done before the query is completed. This
-		// reduces the connection reuse efficiency.
-		ctx, cancel := context.WithTimeout(context.Background(), defaultDoHTimeout)
-		defer cancel()
-
-		var r *[]byte
-		var err error
-		if queryLen > maxGetURLLen {
-			// Use POST for large queries to avoid "414 Request-URI Too Large".
-			body := make([]byte, len(wire))
-			copy(body, wire)
-			r, err = u.exchangePost(ctx, body)
-		} else {
-			queryBuf := make([]byte, queryLen)
-			p := 0
-			p += copy(queryBuf, "dns=")
-
-			// Padding characters for base64url MUST NOT be included.
-			// See: https://tools.ietf.org/html/rfc8484#section-6.
-			base64.RawURLEncoding.Encode(queryBuf[p:], wire)
-			r, err = u.exchange(ctx, utils.BytesToStringUnsafe(queryBuf))
-		}
-
-		if err != nil {
-			u.logger.Check(zap.WarnLevel, "exchange failed").Write(zap.Error(err))
-		}
-		resChan <- res{r: r, err: err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil, context.Cause(ctx)
-	case res := <-resChan:
-		r := res.r
-		err := res.err
-		if r != nil {
-			binary.BigEndian.PutUint16(*r, binary.BigEndian.Uint16(q))
-		}
-		return r, err
+	if err != nil {
+		u.logger.Check(zap.WarnLevel, "exchange failed").Write(zap.Error(err))
 	}
+	if r != nil {
+		binary.BigEndian.PutUint16(*r, binary.BigEndian.Uint16(q))
+	}
+	return r, err
 }
 
 func (u *Upstream) exchange(ctx context.Context, dnsQuery string) (*[]byte, error) {

@@ -24,12 +24,14 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/miekg/dns"
 )
 
 type Matcher struct {
-	m map[dns.Question][]dns.RR
+	mu sync.RWMutex
+	m  map[dns.Question][]dns.RR
 }
 
 func (m *Matcher) LoadFile(s string) error {
@@ -50,6 +52,8 @@ func (m *Matcher) LoadFile(s string) error {
 }
 
 func (m *Matcher) Load(r io.Reader) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.m == nil {
 		m.m = make(map[dns.Question][]dns.RR)
 	}
@@ -74,6 +78,8 @@ func (m *Matcher) Load(r io.Reader) error {
 
 func (m *Matcher) Search(q dns.Question) []dns.RR {
 	q.Name = strings.ToLower(q.Name)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.m[q]
 }
 

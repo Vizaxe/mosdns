@@ -35,6 +35,18 @@ func copyMsgNoOptWithTTL(m *dns.Msg, ttlDelta uint32, subtract bool) *dns.Msg {
 		return nil
 	}
 
+	adjustTTL := func(h *dns.RR_Header) {
+		if subtract {
+			if h.Ttl > ttlDelta {
+				h.Ttl -= ttlDelta
+			} else {
+				h.Ttl = 1
+			}
+		} else {
+			h.Ttl = ttlDelta
+		}
+	}
+
 	m2 := new(dns.Msg)
 	m2.MsgHdr = m.MsgHdr
 	m2.Compress = m.Compress
@@ -47,29 +59,13 @@ func copyMsgNoOptWithTTL(m *dns.Msg, ttlDelta uint32, subtract bool) *dns.Msg {
 	m2.Answer = make([]dns.RR, len(m.Answer))
 	for i, r := range m.Answer {
 		cp := dns.Copy(r)
-		if subtract {
-			if ttl := cp.Header().Ttl; ttl > ttlDelta {
-				cp.Header().Ttl = ttl - ttlDelta
-			} else {
-				cp.Header().Ttl = 1
-			}
-		} else {
-			cp.Header().Ttl = ttlDelta
-		}
+		adjustTTL(cp.Header())
 		m2.Answer[i] = cp
 	}
 	m2.Ns = make([]dns.RR, len(m.Ns))
 	for i, r := range m.Ns {
 		cp := dns.Copy(r)
-		if subtract {
-			if ttl := cp.Header().Ttl; ttl > ttlDelta {
-				cp.Header().Ttl = ttl - ttlDelta
-			} else {
-				cp.Header().Ttl = 1
-			}
-		} else {
-			cp.Header().Ttl = ttlDelta
-		}
+		adjustTTL(cp.Header())
 		m2.Ns[i] = cp
 	}
 
@@ -79,15 +75,7 @@ func copyMsgNoOptWithTTL(m *dns.Msg, ttlDelta uint32, subtract bool) *dns.Msg {
 			continue
 		}
 		cp := dns.Copy(r)
-		if subtract {
-			if ttl := cp.Header().Ttl; ttl > ttlDelta {
-				cp.Header().Ttl = ttl - ttlDelta
-			} else {
-				cp.Header().Ttl = 1
-			}
-		} else {
-			cp.Header().Ttl = ttlDelta
-		}
+		adjustTTL(cp.Header())
 		m2.Extra = append(m2.Extra, cp)
 	}
 	return m2

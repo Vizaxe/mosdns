@@ -149,5 +149,6 @@ func (c *MemoryCache[K, V]) Flush() {
 }
 
 func (c *MemoryCache[K, V]) Delete(key K) error {
+	c.m.Del(key)
 	return nil
 }

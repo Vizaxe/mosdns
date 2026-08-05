@@ -75,7 +75,11 @@ func srcIP2Cm(ip net.IP) []byte {
 }
 
 func initOobHandler(c *net.UDPConn) (getSrcAddrFromOOB, writeSrcAddrToOOB, error) {
-	if !c.LocalAddr().(*net.UDPAddr).IP.IsUnspecified() {
+	la, ok := c.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return nil, nil, fmt.Errorf("unexpected local address type: %T", c.LocalAddr())
+	}
+	if !la.IP.IsUnspecified() {
 		return nil, nil, nil
 	}
 

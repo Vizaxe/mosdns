@@ -37,11 +37,17 @@ const (
 func Ip2PtrFqdn(addr netip.Addr) (fqdn string) {
 	if addr.Is4() {
 		d := addr.String() + IP4arpa
-		reverse, _ := ParsePTRQName(d)
+		reverse, err := ParsePTRQName(d)
+		if err != nil {
+			return ""
+		}
 		fqdn = reverse.String() + IP4arpa
 	} else if addr.Is6() {
 		d := addr.String() + IP6arpa
-		reverse, _ := ParsePTRQName(d)
+		reverse, err := ParsePTRQName(d)
+		if err != nil {
+			return ""
+		}
 		fqdn = reverse.String() + IP6arpa
 	}
 	return
@@ -67,12 +73,12 @@ func reverse4(s string) (netip.Addr, error) {
 		label, offset = prevLabel(s, offset)
 		n, err := strconv.ParseUint(label, 10, 8)
 		if err != nil {
-			return netip.Addr{}, fmt.Errorf("invaild bit, %w", err)
+			return netip.Addr{}, fmt.Errorf("invalid bit, %w", err)
 		}
 		buf[l] = byte(n)
 	}
 	if l < len(buf) {
-		return netip.Addr{}, fmt.Errorf("expact at least 3 labels, got %d", l)
+		return netip.Addr{}, fmt.Errorf("expect at least 4 labels, got %d", l)
 	}
 	return netip.AddrFrom4(buf), nil
 }
@@ -91,7 +97,7 @@ func reverse6(s string) (netip.Addr, error) {
 		b := label[0]
 		n, ok := hex2byte(b)
 		if !ok {
-			return netip.Addr{}, fmt.Errorf("invaild bit %d", b)
+			return netip.Addr{}, fmt.Errorf("invalid bit %d", b)
 		}
 		if tail {
 			buf[l] = val<<4 + n
@@ -103,7 +109,7 @@ func reverse6(s string) (netip.Addr, error) {
 		}
 	}
 	if l < len(buf) {
-		return netip.Addr{}, fmt.Errorf("expact at least 16 bytes, got %d", l)
+		return netip.Addr{}, fmt.Errorf("expect at least 16 bytes, got %d", l)
 	}
 	return netip.AddrFrom16(buf), nil
 }

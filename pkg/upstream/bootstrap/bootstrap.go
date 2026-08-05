@@ -102,13 +102,17 @@ func (sp *Bootstrap) GetAddrPortStr(ctx context.Context) (string, error) {
 
 func (sp *Bootstrap) tryUpdate() {
 	if sp.updating.CompareAndSwap(false, true) {
-		if time.Now().After(sp.nextUpdate) {
+		sp.m.Lock()
+		needUpdate := time.Now().After(sp.nextUpdate)
+		sp.m.Unlock()
+		if needUpdate {
 			go func() {
 				defer sp.updating.Store(false)
 				ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 				defer cancel()
 				start := time.Now()
 				addr, ttl, err := sp.updateAddr(ctx)
+				sp.m.Lock()
 				if err != nil {
 					sp.logger.Check(zap.WarnLevel, "failed to update bootstrap addr").Write(
 						zap.String("fqdn", sp.fqdn),
@@ -128,6 +132,7 @@ func (sp *Bootstrap) tryUpdate() {
 					)
 					sp.nextUpdate = time.Now().Add(updateInterval)
 				}
+				sp.m.Unlock()
 			}()
 		} else {
 			sp.updating.Store(false)

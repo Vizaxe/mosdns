@@ -134,7 +134,7 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 		h.opts.Logger.Error("internal err: failed to pack resp msg", qCtx.InfoField(), zap.Error(err))
 		return nil
 	}
-	h.opts.Logger.Info(qCtx.LogLine())
+	h.opts.Logger.Debug(qCtx.LogLine())
 	return payload
 }
 

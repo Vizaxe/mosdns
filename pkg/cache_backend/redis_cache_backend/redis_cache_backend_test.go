@@ -39,20 +39,22 @@ var _ cache_backend.CacheBackend[cache_backend.StringKey, string] = (*RedisCache
 //}
 
 func TestRedisCache_Get(t *testing.T) {
-	url := "redis://localhost:6379/6"
+	url := "redis://127.0.0.1:6379/6"
 	c, err := NewRedisCache(url)
 	if err != nil {
 		t.Fatal(fmt.Errorf("invalid redis url, %w", err))
 	}
+	// 先写入再读取，确保测试自洽
+	c.Store("test_query_cache:A:IN:qq.com.", "test_value", time.Minute*2)
 	v, d, ok := c.Get("test_query_cache:A:IN:qq.com.")
 	if !ok {
-		t.Fatal(fmt.Errorf("get faild"))
+		t.Fatal(fmt.Errorf("get failed"))
 	}
 	fmt.Printf("%v - > %v", v, d)
 }
 
 func TestRedisCache_Store(t *testing.T) {
-	url := "redis://localhost:6379/6"
+	url := "redis://127.0.0.1:6379/6"
 	opt, err := redis.ParseURL(url)
 	if err != nil {
 		t.Fatal(fmt.Errorf("invalid redis url, %w", err))

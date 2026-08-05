@@ -168,6 +168,13 @@ func (d *V2rayGeoip) reload() error {
 	return nil
 }
 
+func (d *V2rayGeoip) Close() error {
+	if d.cancel != nil {
+		d.cancel()
+	}
+	return nil
+}
+
 func LoadFile(file string, code string, l *netlist.List) error {
 	if len(file) > 0 {
 		cidrs, err := geofile.LoadIP(file, code)

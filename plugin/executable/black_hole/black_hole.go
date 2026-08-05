@@ -129,7 +129,7 @@ func loadFromFile(f string) ([]string, error) {
 // query has corresponding qtypes.
 func (b *BlackHole) Exec(_ context.Context, qCtx *query_context.Context) error {
 	if r := b.Response(qCtx.Q()); r != nil {
-		b.logger.Info("result change", zap.Any("query", qCtx), zap.Any("resp", r))
+		b.logger.Debug("result change", qCtx.InfoField(), zap.Int("rcode", r.Rcode))
 		if or := qCtx.R(); or != nil {
 			qCtx.SetBlackHoleOrigResp(or)
 		}

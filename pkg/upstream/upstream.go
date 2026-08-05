@@ -234,6 +234,21 @@ func (u *dohWithClose) Close() error {
 	return nil
 }
 
+// quicUpstream 包装 PipelineTransport，在 Close 时同时关闭 quic.Transport
+// 和底层 UDP socket，避免资源泄漏。
+type quicUpstream struct {
+	*transport.PipelineTransport
+	transport *quic.Transport
+	conn      net.PacketConn
+}
+
+func (u *quicUpstream) Close() error {
+	err := u.PipelineTransport.Close()
+	u.transport.Close()
+	u.conn.Close()
+	return err
+}
+
 func newDefaultClientQuicConfig() *quic.Config {
 	return &quic.Config{
 		TokenStore: quic.NewLRUTokenStore(4, 8),
@@ -401,61 +416,14 @@ func (cd *commonDialer) newHTTPSUpstream(addrURL *url.URL) (Upstream, error) {
 
 	var t http.RoundTripper
 	var addonCloser io.Closer
+	var err error
 	if cd.opt.EnableHTTP3 {
-		udpBootstrap, err := cd.newUdpAddrResolveFunc(defaultPort)
-		if err != nil {
-			return nil, fmt.Errorf("failed to init udp addr bootstrap, %w", err)
-		}
-
-		lc := net.ListenConfig{Control: getSocketControlFunc(socketOpts{so_mark: cd.opt.SoMark, bind_to_device: cd.opt.BindToDevice})}
-		conn, err := lc.ListenPacket(context.Background(), "udp", "")
-		if err != nil {
-			return nil, fmt.Errorf("failed to init udp socket for quic, %w", err)
-		}
-		quicTransport := &quic.Transport{
-			Conn: conn,
-		}
-		quicConfig := newDefaultClientQuicConfig()
-		quicConfig.MaxIdleTimeout = idleConnTimeout
-
-		addonCloser = quicTransport
-		t = &http3.Transport{
-			TLSClientConfig: cd.opt.TLSConfig,
-			QUICConfig:      quicConfig,
-			Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-				ua, err := udpBootstrap(ctx)
-				if err != nil {
-					return nil, err
-				}
-				return quicTransport.DialEarly(ctx, ua, tlsCfg, cfg)
-			},
-			MaxResponseHeaderBytes: 4 * 1024,
-		}
+		t, addonCloser, err = cd.newHTTP3RoundTripper(defaultPort, idleConnTimeout)
 	} else {
-		tcpDialer, err := cd.newTcpDialer(false, defaultPort)
-		if err != nil {
-			return nil, fmt.Errorf("failed to init tcp dialer, %w", err)
-		}
-		t1 := &http.Transport{
-			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				c, err := tcpDialer(ctx)
-				c = wrapConn(c, cd.opt.EventObserver)
-				return c, err
-			},
-			TLSClientConfig:     cd.opt.TLSConfig,
-			TLSHandshakeTimeout: tlsHandshakeTimeout,
-			IdleConnTimeout:     idleConnTimeout,
-		}
-
-		t2, err := http2.ConfigureTransports(t1)
-		if err != nil {
-			return nil, fmt.Errorf("failed to upgrade http2 support, %w", err)
-		}
-		t2.MaxHeaderListSize = 4 * 1024
-		t2.MaxReadFrameSize = 16 * 1024
-		t2.ReadIdleTimeout = time.Second * 30
-		t2.PingTimeout = time.Second * 5
-		t = t1
+		t, err = cd.newHTTP2RoundTripper(defaultPort, idleConnTimeout)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	u, err := doh.NewUpstream(addrURL.String(), cd.opt.UserAgent, t, cd.opt.Logger)
@@ -470,6 +438,81 @@ func (cd *commonDialer) newHTTPSUpstream(addrURL *url.URL) (Upstream, error) {
 		u:      u,
 		closer: addonCloser,
 	}, nil
+}
+
+// newHTTP3RoundTripper 创建 HTTP/3 (DoH3) 的 RoundTripper。
+func (cd *commonDialer) newHTTP3RoundTripper(defaultPort uint16, idleConnTimeout time.Duration) (http.RoundTripper, io.Closer, error) {
+	udpBootstrap, err := cd.newUdpAddrResolveFunc(defaultPort)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to init udp addr bootstrap, %w", err)
+	}
+
+	lc := net.ListenConfig{Control: getSocketControlFunc(socketOpts{so_mark: cd.opt.SoMark, bind_to_device: cd.opt.BindToDevice})}
+	conn, err := lc.ListenPacket(context.Background(), "udp", "")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to init udp socket for quic, %w", err)
+	}
+	quicTransport := &quic.Transport{
+		Conn: conn,
+	}
+	quicConfig := newDefaultClientQuicConfig()
+	quicConfig.MaxIdleTimeout = idleConnTimeout
+
+	t := &http3.Transport{
+		TLSClientConfig: cd.opt.TLSConfig,
+		QUICConfig:      quicConfig,
+		Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			ua, err := udpBootstrap(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return quicTransport.DialEarly(ctx, ua, tlsCfg, cfg)
+		},
+		MaxResponseHeaderBytes: 4 * 1024,
+	}
+	// 组合 closer，确保 Close 时同时关闭 quic.Transport 和底层 UDP socket
+	closer := &quicTransportCloser{transport: quicTransport, conn: conn}
+	return t, closer, nil
+}
+
+// quicTransportCloser 同时关闭 quic.Transport 和底层 UDP socket。
+type quicTransportCloser struct {
+	transport *quic.Transport
+	conn      net.PacketConn
+}
+
+func (c *quicTransportCloser) Close() error {
+	err := c.transport.Close()
+	c.conn.Close()
+	return err
+}
+
+// newHTTP2RoundTripper 创建 HTTP/2 (DoH) 的 RoundTripper。
+func (cd *commonDialer) newHTTP2RoundTripper(defaultPort uint16, idleConnTimeout time.Duration) (http.RoundTripper, error) {
+	tcpDialer, err := cd.newTcpDialer(false, defaultPort)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init tcp dialer, %w", err)
+	}
+	t1 := &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			c, err := tcpDialer(ctx)
+			c = wrapConn(c, cd.opt.EventObserver)
+			return c, err
+		},
+		TLSClientConfig:     cd.opt.TLSConfig,
+		TLSHandshakeTimeout: tlsHandshakeTimeout,
+		IdleConnTimeout:     idleConnTimeout,
+	}
+
+	t2, err := http2.ConfigureTransports(t1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to upgrade http2 support, %w", err)
+	}
+	t2.MaxHeaderListSize = 4 * 1024
+	t2.MaxReadFrameSize = 16 * 1024
+	t2.ReadIdleTimeout = time.Second * 30
+	t2.PingTimeout = time.Second * 5
+	return t1, nil
 }
 
 func (cd *commonDialer) newQUICUpstream() (Upstream, error) {
@@ -529,11 +572,15 @@ func (cd *commonDialer) newQUICUpstream() (Upstream, error) {
 		return transport.NewQuicDnsConn(c), nil
 	}
 
-	return transport.NewPipelineTransport(transport.PipelineOpts{
-		DialContext:                    dialDnsConn,
-		MaxConcurrentQueryWhileDialing: 90,
-		Logger:                         cd.opt.Logger,
-	}), nil
+	return &quicUpstream{
+		PipelineTransport: transport.NewPipelineTransport(transport.PipelineOpts{
+			DialContext:                    dialDnsConn,
+			MaxConcurrentQueryWhileDialing: 90,
+			Logger:                         cd.opt.Logger,
+		}),
+		transport: t,
+		conn:      uc,
+	}, nil
 }
 
 func (cd *commonDialer) newUdpAddrResolveFunc(defaultPort uint16) (func(ctx context.Context) (*net.UDPAddr, error), error) {

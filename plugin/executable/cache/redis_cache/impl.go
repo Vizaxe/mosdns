@@ -29,6 +29,17 @@ func (c *RedisCache) StoreDns(q *dns.Msg, r *dns.Msg) {
 	c.saveRespToCache(key, r, c.args.LazyCacheTTL, "")
 }
 
+// DeleteByQuery 生成与 QueryDns/StoreDns 完全相同的 key 并删除该缓存条目。
+// 供 dnsmasq_dhcp_leases 等数据源插件在数据变化时精确清理缓存，
+// 避免使用 Clean（prefix:* 全量删除）误伤同库共享同前缀的其他业务 key。
+func (c *RedisCache) DeleteByQuery(q *dns.Msg) error {
+	key := getMsgKey(q, c.args.Separator, c.args.Prefix)
+	if len(key) == 0 {
+		return nil
+	}
+	return c.backend.Delete(cache_backend.StringKey(key))
+}
+
 func (c *RedisCache) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closeNotify)

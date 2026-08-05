@@ -53,19 +53,25 @@ func UnmarshalItem(rawBytes []byte) *cache.Item {
 	}
 }
 
-func MarshalItem(item *cache.Item) []byte {
+func MarshalItem(item *cache.Item) ([]byte, error) {
 	v := &cacheItemJSON{
 		Resp:           dnsMsgToBase64(item.Resp),
 		BlockHoleTag:   item.BlockHoleTag,
 		StoredTime:     item.StoredTime.Format(layout),
 		ExpirationTime: item.ExpirationTime.Format(layout),
 	}
-	b, _ := json.Marshal(v)
-	return b
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 func dnsMsgToBase64(m *dns.Msg) string {
-	b, _ := m.Pack()
+	b, err := m.Pack()
+	if err != nil {
+		return ""
+	}
 	return base64.StdEncoding.EncodeToString(b)
 }
 

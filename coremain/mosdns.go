@@ -24,6 +24,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/pprof"
+	"os"
+	"runtime/debug"
+
 	"github.com/IrineSistiana/mosdns/v5/mlog"
 	"github.com/IrineSistiana/mosdns/v5/pkg/safe_close"
 	"github.com/go-chi/chi/v5"
@@ -31,11 +37,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
-	"io"
-	"net/http"
-	"net/http/pprof"
-	"os"
-	"runtime/debug"
 )
 
 type Mosdns struct {
@@ -198,7 +199,7 @@ func (m *Mosdns) registerPluginCloseHandler() {
 			<-closeSignal
 			m.logger.Info("starting shutdown sequences")
 			for tag, p := range m.plugins {
-				if closer, _ := p.(io.Closer); closer != nil {
+				if closer, ok := p.(io.Closer); ok {
 					m.logger.Info("closing plugin", zap.String("tag", tag))
 					_ = closer.Close()
 				}

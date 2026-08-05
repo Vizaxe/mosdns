@@ -17,13 +17,23 @@ func (c *MemoryCache) Store(key key, value *cache.Item, ttl time.Duration) {
 	c.backend.Store(key, value, ttl)
 }
 
+func (c *MemoryCache) getKey(q *dns.Msg) string {
+	if q.Response || q.Opcode != dns.OpcodeQuery || len(q.Question) != 1 {
+		return ""
+	}
+	if *c.args.EdnsKey {
+		return getMsgKey(q) // 原逻辑，包含 EDNS 标志位
+	}
+	return cache.MsgQuestionKey(q, ":", "") // 仅使用问题定义
+}
+
 func (c *MemoryCache) QueryDns(q *dns.Msg) (*dns.Msg, bool) {
-	key := getMsgKey(q)
+	key := c.getKey(q)
 	return getRespFromCache(key, c.backend, c.args.LazyCacheTTL > 0, expiredMsgTtl)
 }
 
 func (c *MemoryCache) StoreDns(q *dns.Msg, r *dns.Msg) {
-	key := getMsgKey(q)
+	key := c.getKey(q)
 	saveRespToCache(key, r, c.backend, c.args.LazyCacheTTL)
 }
 

@@ -34,7 +34,7 @@ const (
 )
 
 var (
-	ErrPayloadTooSmall = errors.New("payload is to small for a valid dns msg")
+	ErrPayloadTooSmall = errors.New("payload is too small for a valid dns msg")
 )
 
 // ReadRawMsgFromTCP reads msg from c in RFC 1035 format (msg is prefixed
@@ -54,6 +54,9 @@ func ReadRawMsgFromTCP(c io.Reader) (*[]byte, error) {
 	length := binary.BigEndian.Uint16(*h)
 	if length <= DnsHeaderLen {
 		return nil, ErrPayloadTooSmall
+	}
+	if length > dns.MaxMsgSize {
+		return nil, fmt.Errorf("tcp dns msg body length %d exceeds max %d", length, dns.MaxMsgSize)
 	}
 
 	b := pool.GetBuf(int(length))

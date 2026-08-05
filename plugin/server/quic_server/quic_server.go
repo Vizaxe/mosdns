@@ -107,6 +107,11 @@ func StartServer(bp *coremain.BP, args *Args) (*QuicServer, error) {
 
 		// UniStream is not allowed.
 		MaxIncomingUniStreams: -1,
+
+		// 限制单连接上的并发双向 stream 数，防止恶意客户端
+		// 在单条连接上打开大量 stream 消耗服务端资源。
+		// server 层另有全局并发信号量（defaultMaxConcurrentQueries）兜底。
+		MaxIncomingStreams: 256,
 	}
 
 	srk, _, err := utils.InitQUICSrkFromIfaceMac()
